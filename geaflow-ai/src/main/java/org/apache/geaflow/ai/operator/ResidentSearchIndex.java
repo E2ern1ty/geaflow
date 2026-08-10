@@ -65,6 +65,11 @@ public class ResidentSearchIndex {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ResidentSearchIndex.class);
 
+    /**
+     * How many times to retry a build that a concurrent graph write invalidated mid scan.
+     */
+    private static final int MAX_BUILD_ATTEMPTS = 3;
+
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     private volatile GraphSearchStore store;
@@ -72,6 +77,7 @@ public class ResidentSearchIndex {
     private volatile long builtVersion = GraphAccessor.VERSION_UNSUPPORTED;
 
     private volatile long buildCount = 0L;
+    private volatile long discardedBuildCount = 0L;
     private volatile long upsertCount = 0L;
     private volatile long removeCount = 0L;
 
@@ -123,19 +129,22 @@ public class ResidentSearchIndex {
      */
     public void onEntitiesUpserted(GraphAccessor graphAccessor, List<GraphEntity> entities,
                                    IndexStore indexStore, VertexVersionWindow window) {
-        applyWrite(graphAccessor, entities, indexStore, false, window);
+        applyWrite(graphAccessor, entities, indexStore, window);
     }
 
     /**
      * Applies removed entities to the index in place, without rebuilding it.
+     *
+     * <p>Shares one code path with {@link #onEntitiesUpserted}: whether a reported entity ends up
+     * indexed or dropped is decided by looking it up in the graph, not by which hook was called.
      */
     public void onEntitiesRemoved(GraphAccessor graphAccessor, List<GraphEntity> entities,
-                                  VertexVersionWindow window) {
-        applyWrite(graphAccessor, entities, null, true, window);
+                                  IndexStore indexStore, VertexVersionWindow window) {
+        applyWrite(graphAccessor, entities, indexStore, window);
     }
 
     private void applyWrite(GraphAccessor graphAccessor, List<GraphEntity> entities,
-                            IndexStore indexStore, boolean removed, VertexVersionWindow window) {
+                            IndexStore indexStore, VertexVersionWindow window) {
         if (entities == null || entities.isEmpty()) {
             return;
         }
@@ -158,23 +167,7 @@ public class ResidentSearchIndex {
                 if (!(entity instanceof GraphVertex)) {
                     continue;
                 }
-                if (removed) {
-                    store.removeEntity(entity);
-                    removeCount++;
-                    changed = true;
-                    continue;
-                }
-                List<IVector> vectors = indexStore.getEntityIndex(entity);
-                if (vectors == null || vectors.isEmpty()) {
-                    // An entity without index content is not a document; drop any previous one.
-                    // Delete by term is idempotent, so there is no need to track what was indexed.
-                    store.removeEntity(entity);
-                    changed = true;
-                    continue;
-                }
-                store.upsertVertex((GraphVertex) entity, vectors);
-                upsertCount++;
-                changed = true;
+                changed |= reconcile(graphAccessor, indexStore, (GraphVertex) entity);
             }
             if (changed) {
                 // One refresh per batch rather than per entity: each refresh opens a new segment.
@@ -184,6 +177,41 @@ public class ResidentSearchIndex {
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    /**
+     * Brings the index in line with what the graph currently holds for one reported entity.
+     *
+     * <p>The graph decides, not the caller: a reported entity is looked up and whatever the graph
+     * has under that label and id is indexed, or the document is dropped when the graph has nothing.
+     * Trusting the caller's object instead lets the two diverge, because the object it reports is a
+     * <em>request</em> that the graph may have rejected. A duplicate id carrying different text is
+     * the concrete case: the graph keeps the previous vertex, so indexing the request would make the
+     * new text match while retrieval resolves and returns the old vertex, and the text actually in
+     * the graph would stop being searchable.
+     *
+     * @return whether the index was changed
+     */
+    private boolean reconcile(GraphAccessor graphAccessor, IndexStore indexStore,
+                              GraphVertex reported) {
+        GraphVertex current = graphAccessor.getVertex(reported.getLabel(),
+            reported.getVertex().getId());
+        if (current == null) {
+            // Gone from the graph. Delete by term is idempotent, so this needs no record of what
+            // was previously indexed.
+            store.removeEntity(reported);
+            removeCount++;
+            return true;
+        }
+        List<IVector> vectors = indexStore.getEntityIndex(current);
+        if (vectors == null || vectors.isEmpty()) {
+            // An entity without index content is not a document; drop any previous one.
+            store.removeEntity(current);
+            return true;
+        }
+        store.upsertVertex(current, vectors);
+        upsertCount++;
+        return true;
     }
 
     /**
@@ -224,6 +252,14 @@ public class ResidentSearchIndex {
         return buildCount;
     }
 
+    /**
+     * Number of builds thrown away because the graph changed while they were scanning. Non zero
+     * means writes are landing during builds, so a query paid for a scan it could not use.
+     */
+    public long getDiscardedBuildCount() {
+        return discardedBuildCount;
+    }
+
     public long getUpsertCount() {
         return upsertCount;
     }
@@ -255,8 +291,8 @@ public class ResidentSearchIndex {
     }
 
     private void ensureGlobalIndexLocked(GraphAccessor graphAccessor, IndexStore indexStore) {
-        long version = graphAccessor.getVertexVersion();
         if (globalIndexBuilt) {
+            long version = graphAccessor.getVertexVersion();
             if (version != GraphAccessor.VERSION_UNSUPPORTED && version == builtVersion) {
                 return;
             }
@@ -265,8 +301,54 @@ public class ResidentSearchIndex {
             // results.
             invalidateLocked();
         }
-        final long start = System.currentTimeMillis();
+        for (int attempt = 1; attempt <= MAX_BUILD_ATTEMPTS; attempt++) {
+            final long start = System.currentTimeMillis();
+            // Read before and after the scan. This lock does not cover the graph, so a write can
+            // land while the scan is in flight, and the result would then be a mixed snapshot. It
+            // must not be published under the version observed at the start, because the very same
+            // call goes on to search it, and the next call would find the version consistent and
+            // reuse it.
+            long before = graphAccessor.getVertexVersion();
+            GraphSearchStore built = new GraphSearchStore();
+            final int indexed = scanInto(built, graphAccessor, indexStore);
+            long after = graphAccessor.getVertexVersion();
+            if (after != before) {
+                LOGGER.info("Graph changed while building the resident keyword index ({} -> {}), "
+                    + "discarding attempt {} of {}", before, after, attempt, MAX_BUILD_ATTEMPTS);
+                closeQuietly(built);
+                discardedBuildCount++;
+                continue;
+            }
+            built.refresh();
+            store = built;
+            globalIndexBuilt = true;
+            builtVersion = before;
+            buildCount++;
+            LOGGER.info("Built resident keyword index, entities: {}, vertexVersion: {}, cost: {} ms",
+                indexed, before, System.currentTimeMillis() - start);
+            return;
+        }
+        // The graph is being written continuously and offers no snapshot isolation, so no scan can
+        // be proven consistent. Serve the last attempt but refuse to vouch for it: an unsupported
+        // version makes every later query rebuild instead of reusing this one.
+        LOGGER.warn("Could not build a stable resident keyword index in {} attempts; the index will "
+            + "be rebuilt on every query until writes settle", MAX_BUILD_ATTEMPTS);
         GraphSearchStore built = new GraphSearchStore();
+        scanInto(built, graphAccessor, indexStore);
+        built.refresh();
+        store = built;
+        globalIndexBuilt = true;
+        builtVersion = GraphAccessor.VERSION_UNSUPPORTED;
+        buildCount++;
+    }
+
+    /**
+     * Indexes every vertex that has index content into {@code target}.
+     *
+     * @return number of indexed vertices
+     */
+    private int scanInto(GraphSearchStore target, GraphAccessor graphAccessor,
+                         IndexStore indexStore) {
         // Deduplication is only needed while scanning; unlike the index itself this set is not
         // retained, so a resident index costs no per vertex heap of its own.
         Set<GraphEntity> seen = new HashSet<>();
@@ -278,24 +360,22 @@ public class ResidentSearchIndex {
             }
             // Plain add during the build: the scan yields each vertex once, so no term lookup for
             // duplicate removal is needed and build cost stays as low as possible.
-            built.indexVertex(vertex, vectors);
+            target.indexVertex(vertex, vectors);
         }
-        built.refresh();
-        store = built;
-        globalIndexBuilt = true;
-        builtVersion = version;
-        buildCount++;
-        LOGGER.info("Built resident keyword index, entities: {}, vertexVersion: {}, cost: {} ms",
-            seen.size(), version, System.currentTimeMillis() - start);
+        return seen.size();
+    }
+
+    private static void closeQuietly(GraphSearchStore searchStore) {
+        try {
+            searchStore.close();
+        } catch (Throwable e) {
+            LOGGER.warn("Ignore error on closing a discarded keyword index", e);
+        }
     }
 
     private void invalidateLocked() {
         if (store != null) {
-            try {
-                store.close();
-            } catch (Throwable e) {
-                LOGGER.warn("Ignore error on closing resident keyword index", e);
-            }
+            closeQuietly(store);
         }
         store = null;
         globalIndexBuilt = false;

@@ -429,7 +429,15 @@ E 的每轮 1.4 ms 高于纯读稳态的 0.4 ms，成本落在写入与 `refresh
 
 真正剩下的是刷新攒批：目前一批写入（一次 HTTP 请求）刷新一次，`commit()` 已去掉（§3.9），但批量导入场景下仍然是每请求一次 reader 重开。按时间或按变更量延迟刷新（对应 Elasticsearch 的 `refresh_interval`）能把这部分摊薄，代价是可见性延迟。
 
-### 6.6 版本号仅内存图实现
+### 6.6 查询串在服务路径上被包装成对象字面量（既有缺陷，本特性未触碰）
+
+§3.3 说的"文档集、查询、打分器三者相同因此召回相同"，是相对于每查询重建方案而言的等价性，**不等于关键词匹配本身是对的**。
+
+`SessionOperator.apply()` 用 `contents.add(v.toString())` 拼查询串，而 `KeywordVector.toString()` 返回 `KeywordVector{vec=[xxx]}`。经 `SearchUtils.formatQuery` 清洗后查询串含 `keywordvector`、`vec` 两个 token，而文档内容同样由 `toString()` 拼出、也含这两个 token —— 于是走服务接口的查询与每个文档必然相交，检索词只影响打分。实测 40 文档时任何查询（含图中不存在的词与空串）都返回 topN=30 条。
+
+这一行在 master 上即已存在，本特性没有修改它，因此不影响上面的等价性与性能结论：常驻索引与重建路径接受的是同一个查询串，测试也一律传入未包装的查询串（`ResidentSearchIndex.search("grp0")` 在 10000 顶点下精确命中 10 条，不存在的词 0 条）。修它会改变召回，属于独立议题。
+
+### 6.7 版本号仅内存图实现
 
 只有 `MemoryGraph` / `LocalMemoryGraphAccessor` 上报版本。未来 `GeaFlowStateGraphAccessor` 若不实现 `getVertexVersion()`，常驻索引会退化为每查询重建 —— 安全但无收益。接引擎时须一并实现版本上报。
 

@@ -185,7 +185,7 @@ public class GraphMemoryServer {
             }
             ResidentSearchIndex residentIndex = residentIndexes.get(indexStore);
             if (residentIndex != null) {
-                residentIndex.onEntitiesRemoved(graphAccessors.get(0), entities, window);
+                residentIndex.onEntitiesRemoved(graphAccessors.get(0), entities, indexStore, window);
             }
         }
     }

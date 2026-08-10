@@ -31,6 +31,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.geaflow.ai.graph.GraphEntity;
 import org.apache.geaflow.ai.graph.GraphVertex;
 import org.apache.geaflow.ai.graph.LocalMemoryGraphAccessor;
@@ -44,6 +45,7 @@ import org.apache.geaflow.ai.graph.io.Vertex;
 import org.apache.geaflow.ai.graph.io.VertexGroup;
 import org.apache.geaflow.ai.graph.io.VertexSchema;
 import org.apache.geaflow.ai.index.EntityAttributeIndexStore;
+import org.apache.geaflow.ai.index.vector.IVector;
 import org.apache.geaflow.ai.verbalization.SubgraphSemanticPromptFunction;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -370,7 +372,7 @@ public class ResidentSearchIndexTest {
         Vertex removed = accessor.getVertex(LABEL, "id9").getVertex();
         VertexVersionWindow window = write(accessor,
             () -> accessor.getMutableGraph().removeVertex(LABEL, "id9"));
-        residentIndex.onEntitiesRemoved(accessor, entities(removed), window);
+        residentIndex.onEntitiesRemoved(accessor, entities(removed), store, window);
 
         Assertions.assertTrue(residentIndex.search("uniq9", accessor).isEmpty(),
             "the deleted document must no longer be searchable");
@@ -416,6 +418,121 @@ public class ResidentSearchIndexTest {
             idsOf(residentIndex.searchWithIndex(accessor, store, "okapi")));
         Assertions.assertEquals(2L, residentIndex.getBuildCount(),
             "the version guard must force a rebuild for unnotified mutations");
+    }
+
+    /**
+     * A reported entity is a <em>request</em>, and the graph may have rejected it. The index must
+     * follow the graph, not the request: indexing the rejected object would make its text matchable
+     * while retrieval resolves and returns the vertex the graph actually kept, and the text the graph
+     * does hold would stop being searchable.
+     */
+    @Test
+    public void testEntityRejectedByTheGraphIsNotIndexed() {
+        LocalMemoryGraphAccessor accessor = buildGraph(20);
+        EntityAttributeIndexStore store = newIndexStore(accessor);
+        ResidentSearchIndex residentIndex = new ResidentSearchIndex();
+        residentIndex.ensureGlobalIndex(accessor, store);
+        Assertions.assertEquals(Collections.singleton("id7"),
+            idsOf(residentIndex.search("uniq7", accessor)));
+
+        // Same id as an existing vertex, so addVertex rejects it, but the version still advances.
+        Vertex duplicate = new Vertex(LABEL, "id7", Collections.singletonList("quetzal smuggled in"));
+        VertexVersionWindow window = VertexVersionWindow.open(accessor);
+        Assertions.assertNotEquals(0, accessor.getMutableGraph().addVertex(duplicate),
+            "the graph must reject this write, or the test proves nothing");
+        VertexVersionWindow sealed = window.seal();
+        Assertions.assertNotEquals(sealed.getFrom(), sealed.getTo(),
+            "a failed mutation still advances the version, which is what makes this case tricky");
+        // A caller that ignores mutation results would report the rejected request like this.
+        residentIndex.onEntitiesUpserted(accessor, entities(duplicate), store, sealed);
+
+        Assertions.assertTrue(residentIndex.searchWithIndex(accessor, store, "quetzal").isEmpty(),
+            "content the graph rejected must not become searchable");
+        Assertions.assertEquals(Collections.singleton("id7"),
+            idsOf(residentIndex.searchWithIndex(accessor, store, "uniq7")),
+            "the content the graph kept must stay searchable");
+        Assertions.assertEquals(20, residentIndex.getIndexedEntityNum());
+    }
+
+    /**
+     * A concurrent write during the full scan produces a snapshot that cannot be attributed to the
+     * version observed before the scan. Publishing it under that version would let the query that
+     * triggered the build, and every query after it, serve a graph state that never existed.
+     */
+    @Test
+    public void testBuildInterruptedByAConcurrentWriteIsNotPublishedAsConsistent() throws Exception {
+        LocalMemoryGraphAccessor accessor = buildGraph(20);
+        CountDownLatch scanStarted = new CountDownLatch(1);
+        CountDownLatch writeDone = new CountDownLatch(1);
+        // Blocks once, in the middle of the first scan, long enough for a write to land.
+        EntityAttributeIndexStore store = new EntityAttributeIndexStore() {
+            private final AtomicBoolean blocked = new AtomicBoolean(false);
+
+            @Override
+            public List<IVector> getEntityIndex(GraphEntity entity) {
+                if (blocked.compareAndSet(false, true)) {
+                    scanStarted.countDown();
+                    try {
+                        writeDone.await(30, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                return super.getEntityIndex(entity);
+            }
+        };
+        store.initStore(new SubgraphSemanticPromptFunction(accessor));
+
+        ResidentSearchIndex residentIndex = new ResidentSearchIndex();
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        List<GraphEntity> triggeringQuery;
+        try {
+            Future<List<GraphEntity>> query = pool.submit(
+                () -> residentIndex.searchWithIndex(accessor, store, "narwhal"));
+            Assertions.assertTrue(scanStarted.await(30, TimeUnit.SECONDS));
+            accessor.getMutableGraph().addVertex(new Vertex(LABEL, "id-mid",
+                Collections.singletonList("narwhal written mid scan")));
+            writeDone.countDown();
+            triggeringQuery = query.get(60, TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+        }
+
+        // The query that triggered the build is the one at risk. Publishing a mid scan snapshot
+        // under the version read before the scan makes this very call answer from a graph state
+        // that never existed. Later queries recover on their own, so asserting on them proves
+        // nothing.
+        Assertions.assertEquals(Collections.singleton("id-mid"), idsOf(triggeringQuery),
+            "the query that triggered the build must not answer from a mid scan snapshot");
+        Assertions.assertEquals(1L, residentIndex.getDiscardedBuildCount(),
+            "the attempt the write landed in must have been discarded, not published");
+        Assertions.assertEquals(1L, residentIndex.getBuildCount(),
+            "only the stable retry counts as a build");
+        Assertions.assertEquals(Collections.singleton("id-mid"),
+            idsOf(residentIndex.searchWithIndex(accessor, store, "narwhal")));
+    }
+
+    /**
+     * Entity equality is label and id only, so a caller holding a superseded wrapper shares a cache
+     * key with the current one. The memoized value must not leak across that boundary.
+     */
+    @Test
+    public void testStaleEntityWrapperDoesNotPoisonTheCache() {
+        LocalMemoryGraphAccessor accessor = buildGraph(20);
+        EntityAttributeIndexStore store = newIndexStore(accessor);
+        GraphVertex staleWrapper = accessor.getVertex(LABEL, "id5");
+        Assertions.assertNotNull(staleWrapper);
+
+        Vertex updated = new Vertex(LABEL, "id5", Collections.singletonList("ibex rewritten"));
+        Assertions.assertEquals(0, accessor.getMutableGraph().updateVertex(updated));
+        GraphVertex currentWrapper = accessor.getVertex(LABEL, "id5");
+        Assertions.assertEquals(staleWrapper, currentWrapper,
+            "the two wrappers must be equal, or the test proves nothing");
+
+        // A caller still holding the old wrapper asks first, seeding the cache under that key.
+        store.getEntityIndex(staleWrapper);
+        Assertions.assertTrue(store.getEntityIndex(currentWrapper).toString().contains("ibex"),
+            "the current entity must not be served the superseded content as a cache hit");
     }
 
     /**

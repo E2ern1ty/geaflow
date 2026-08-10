@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 import org.apache.geaflow.ai.common.config.Constants;
@@ -42,10 +43,16 @@ import org.apache.geaflow.ai.verbalization.VerbalizationFunction;
  * {@link SubGraph}, renders a prompt and allocates intermediate strings. Since retrieval calls
  * {@link #getEntityIndex} once per candidate entity on every query, the results are memoized.
  *
- * <p>Each entry carries the source version it was computed from, so a write invalidates only the
- * entries it actually affects. Comparing a single version for the whole cache would be simpler but
+ * <p>Each entry carries the source version <b>and the entity content</b> it was computed from, and a
+ * hit requires both to match. Comparing a single version for the whole cache would be simpler but
  * would throw away everything memoized so far on every write, which is exactly what the write heavy
- * paths do (consolidate issues roughly thirty edge writes per inserted entity).
+ * paths do (consolidate issues roughly thirty edge writes per inserted entity). Comparing the
+ * version alone is not enough either, because entity equality ignores content; see
+ * {@link #contentOf}.
+ *
+ * <p>Note the resulting contract: this returns the index of <em>the entity handed to it</em>, not of
+ * whatever the graph currently holds under that label and id. Callers that need the latter must
+ * resolve the entity from the graph first, as {@code ResidentSearchIndex} does.
  *
  * <p><b>No locking.</b> The memoized function is pure and its result is immutable, so the cache needs
  * no mutual exclusion to be correct: a lookup is one {@link ConcurrentHashMap#get}, and a miss
@@ -89,8 +96,9 @@ public class EntityAttributeIndexStore implements IndexStore {
             // The source cannot tell us when it changes, so memoizing would risk stale results.
             return computeEntityIndex(entity);
         }
+        List<String> content = contentOf(entity);
         CachedIndex cached = verbalizationCache.get(entity);
-        if (cached != null && cached.version == version) {
+        if (cached != null && cached.version == version && Objects.equals(cached.content, content)) {
             cacheHit.increment();
             return cached.vectors;
         }
@@ -98,9 +106,25 @@ public class EntityAttributeIndexStore implements IndexStore {
         // A stale entry needs no explicit removal, the put below replaces it.
         List<IVector> computed = computeEntityIndex(entity);
         cacheMiss.increment();
-        verbalizationCache.put(entity, new CachedIndex(computed, version));
+        verbalizationCache.put(entity, new CachedIndex(computed, version, content));
         enforceBound();
         return computed;
+    }
+
+    /**
+     * The part of an entity that the cache key does not already cover.
+     *
+     * <p>Needed because entity equality is label and id only: {@code Vertex.equals} ignores values,
+     * so two wrappers holding different content are the same cache key. Without comparing content, a
+     * caller holding on to a superseded wrapper would compute the old text, store it under the
+     * current version, and the next lookup with an up to date wrapper would be served that stale
+     * text as a hit.
+     */
+    private List<String> contentOf(GraphEntity entity) {
+        if (entity instanceof GraphVertex) {
+            return ((GraphVertex) entity).getVertex().getValues();
+        }
+        return ((GraphEdge) entity).getEdge().getValues();
     }
 
     /**
@@ -185,10 +209,15 @@ public class EntityAttributeIndexStore implements IndexStore {
 
         private final List<IVector> vectors;
         private final long version;
+        /**
+         * Content the entry was computed from, see {@link #contentOf}.
+         */
+        private final List<String> content;
 
-        private CachedIndex(List<IVector> vectors, long version) {
+        private CachedIndex(List<IVector> vectors, long version, List<String> content) {
             this.vectors = vectors;
             this.version = version;
+            this.content = content;
         }
     }
 }
