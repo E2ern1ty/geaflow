@@ -262,15 +262,24 @@ public class EmbeddingIndexStore implements IndexStore {
 
     @Override
     public List<IVector> getEntityIndex(GraphEntity entity) {
-        if (entity != null && indexStoreMap.get(entity) != null) {
-            List<EmbeddingService.EmbeddingResult> resultList = indexStoreMap.get(entity);
-            List<IVector> result = new ArrayList<>();
-            for (EmbeddingService.EmbeddingResult res : resultList) {
-                double[] embedding = res.embedding;
-                result.add(new EmbeddingVector(embedding));
-            }
-            return result;
+        if (entity == null) {
+            return Collections.emptyList();
         }
-        return Collections.emptyList();
+        List<EmbeddingService.EmbeddingResult> resultList = indexStoreMap.get(entity);
+        if (resultList == null) {
+            return Collections.emptyList();
+        }
+        if (resultList.isEmpty()) {
+            // An entity that was looked at but held no embeddable text is indistinguishable from an
+            // entity nobody has looked at yet, since both give an empty result. Say which it was.
+            LOGGER.debug("Entity {} was checked and holds no embeddable text",
+                    ModelUtils.getGraphEntityKey(entity));
+            return Collections.emptyList();
+        }
+        List<IVector> result = new ArrayList<>(resultList.size());
+        for (EmbeddingService.EmbeddingResult res : resultList) {
+            result.add(new EmbeddingVector(res.embedding));
+        }
+        return result;
     }
 }
