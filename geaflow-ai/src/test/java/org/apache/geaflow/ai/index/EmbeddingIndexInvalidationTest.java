@@ -38,6 +38,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.apache.geaflow.ai.GraphMemoryServer;
 import org.apache.geaflow.ai.common.model.EmbeddingResponse;
 import org.apache.geaflow.ai.common.model.EmbeddingService;
@@ -89,12 +92,16 @@ public class EmbeddingIndexInvalidationTest {
     private HttpServer server;
     private final List<String> requestBodies = new CopyOnWriteArrayList<>();
     private final Map<String, Integer> textDimensions = new LinkedHashMap<>();
+    /** Set only by the test that needs to read while a build is in flight. */
+    private volatile CountDownLatch arrivedAtEndpoint;
+    private volatile CountDownLatch holdEndpoint;
 
     @BeforeEach
     void startEndpoint() throws IOException {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/v1/embeddings", this::handle);
-        server.setExecutor(null);
+        // A thread of its own, so a handler that is held open does not hold up the test.
+        server.setExecutor(Executors.newCachedThreadPool());
         server.start();
     }
 
@@ -272,6 +279,62 @@ public class EmbeddingIndexInvalidationTest {
         Assertions.assertEquals(0, requestBodies.size(), "and is not paid for twice");
     }
 
+    @Test
+    public void testIndexIsFoundThroughAnyInstanceOfTheEntity(@TempDir Path tempDir) {
+        String indexPath = tempDir.resolve("index.jsonl").toString();
+
+        EmbeddingIndexStore fresh = new EmbeddingIndexStore();
+        Assertions.assertTrue(fresh.getEntityIndex(
+                        graphOf(OLD_VALUE).getVertex(LABEL, "v1")).isEmpty(),
+                "a store that has not been built yet holds nothing, rather than failing");
+
+        LocalMemoryGraphAccessor indexed = graphOf(OLD_VALUE);
+        EmbeddingIndexStore store = initStore(indexed, indexPath);
+
+        // A caller elsewhere asks with its own graph, so its own object for the same entity. What
+        // the index is keyed by has to be the entity's key, not the object.
+        LocalMemoryGraphAccessor elsewhere = graphOf(OLD_VALUE);
+        GraphEntity fromElsewhere = elsewhere.getVertex(LABEL, "v1");
+        Assertions.assertNotSame(indexed.getVertex(LABEL, "v1"), fromElsewhere,
+                "the two graphs really do hand out different objects");
+        Assertions.assertEquals(1.0, onlyVector(store, elsewhere, "v1").match(vectorOf(OLD_VALUE)),
+                1e-9, "and the index is found through either of them");
+    }
+
+    @Test
+    public void testReaderDuringABuildSeesTheIndexAsItWas(@TempDir Path tempDir) throws Exception {
+        String indexPath = tempDir.resolve("index.jsonl").toString();
+
+        LocalMemoryGraphAccessor first = graphOf(OLD_VALUE);
+        EmbeddingIndexStore store = initStore(first, indexPath);
+        Assertions.assertEquals(1.0, onlyVector(store, first, "v1").match(vectorOf(OLD_VALUE)),
+                1e-9, "the first build leaves the vector of the value it was given");
+
+        // Build again on the same store, with the endpoint held open, and read while it is half way
+        // through. The index is assigned once at the end, so a reader is never shown a part of it.
+        CountDownLatch reached = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        arrivedAtEndpoint = reached;
+        holdEndpoint = release;
+        LocalMemoryGraphAccessor changed = graphOf(NEW_VALUE);
+        Thread build = new Thread(() -> store.initStore(changed,
+                new SubgraphSemanticPromptFunction(changed), indexPath, config()));
+        build.start();
+        try {
+            Assertions.assertTrue(reached.await(10, TimeUnit.SECONDS),
+                    "the build should have reached the endpoint");
+            Assertions.assertEquals(1.0,
+                    onlyVector(store, first, "v1").match(vectorOf(OLD_VALUE)), 1e-9,
+                    "a reader during the build still sees the index that was there before");
+        } finally {
+            release.countDown();
+            build.join(20_000);
+        }
+
+        Assertions.assertEquals(1.0, onlyVector(store, changed, "v1").match(vectorOf(NEW_VALUE)),
+                1e-9, "and sees the new one once the build is done");
+    }
+
     private EmbeddingIndexStore initStore(LocalMemoryGraphAccessor accessor, String indexPath) {
         EmbeddingIndexStore store = new EmbeddingIndexStore();
         store.initStore(accessor, new SubgraphSemanticPromptFunction(accessor), indexPath, config());
@@ -313,6 +376,17 @@ public class EmbeddingIndexInvalidationTest {
     private void handle(HttpExchange exchange) throws IOException {
         byte[] requestBytes = readAll(exchange);
         requestBodies.add(new String(requestBytes, StandardCharsets.UTF_8));
+        if (arrivedAtEndpoint != null) {
+            arrivedAtEndpoint.countDown();
+            try {
+                if (!holdEndpoint.await(20, TimeUnit.SECONDS)) {
+                    throw new IOException("the test did not release the endpoint");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(e);
+            }
+        }
 
         String[] inputs = new Gson().fromJson(
                 new String(requestBytes, StandardCharsets.UTF_8), Request.class).input;
